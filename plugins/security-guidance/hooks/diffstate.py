@@ -6,21 +6,27 @@ there so callers keep resolving bare names through the hook module's
 globals — tests that ``monkeypatch.setattr(hook, "<fn>", …)`` continue
 to work without retargeting.
 """
+import errno
 import hashlib
 import os
+import stat
 import subprocess
 import sys
+import unicodedata
 import time
 
-from _base import debug_log, portable_output, _PV
+from _base import debug_log, make_state_dir, portable_output, _PV
+import gitutil
 from gitutil import (
     GIT_CMD,
     _git_dir, _git_toplevel, _git_status_porcelain,
     _git_rev_parse_head, _is_ancestor, _git_name_only, _temp_index,
-    index_entry_count,
+    _secret_rename_origins, index_entry_count,
 )
-from session_state import with_locked_state
+from session_state import load_state, with_locked_state
 from extensibility import _same_dir
+from gitutil import turn_commit_shas
+from session_state import commit_log_files, get_commit_log_file
 
 
 # =====================================================================
@@ -59,7 +65,7 @@ def load_baseline_sha(session_id):
     return with_locked_state(session_id, _load)
 
 
-def record_touched_path(session_id, file_path):
+def record_touched_path(session_id, file_path, custom_rule_stats=None):
     """Append a file path to the touched_paths list (deduped, capped at 200).
 
     Stop is the consumer and clears under the same lock it reads with; UPS
@@ -68,12 +74,67 @@ def record_touched_path(session_id, file_path):
     stale paths so over-retention is harmless, just wasteful.
     """
     def _record(state):
+        # In the save this hook makes anyway: one more could drop another
+        # hook's change where there is no state lock (Windows).
+        _fold_custom_rule_stats(state, custom_rule_stats)
         paths = state.setdefault("touched_paths", [])
         if file_path not in paths:
             paths.append(file_path)
-            if len(paths) > 200:
-                del paths[:len(paths) - 200]
+            if len(paths) > TOUCHED_PATHS_CAP:
+                del paths[:len(paths) - TOUCHED_PATHS_CAP]
     with_locked_state(session_id, _record)
+
+
+# A full Stop row lost these and the turn's commit count, so they travel as
+# one decimal number, each field capped to its digits:
+#   rules (2) shapes (3) gain (3) loss (3) slow_ms (4)
+# 15 digits at most, well inside what a JSON number holds exactly.
+_CUSTOM_RULE_PACK = (("cr_rules", 99), ("cr_shapes", 999), ("cr_gain", 999),
+                     ("cr_loss", 999), ("cr_slow_ms", 9999))
+
+
+# Kept in the state per turn. See extensibility.edit_stats. cr_rules, cr_shapes
+# and cr_slow_ms are maximum or union over the turn's edits, the others are
+# added up.
+CUSTOM_RULE_KEYS = tuple(key for key, _ in _CUSTOM_RULE_PACK)
+
+
+def custom_rule_pack(kept):
+    """The turn's custom rule counts as one number; 0 when there are none."""
+    if not isinstance(kept, dict):
+        return 0
+    value = 0
+    for key, cap in _CUSTOM_RULE_PACK:
+        part = kept.get(key, 0)
+        if not isinstance(part, int) or isinstance(part, bool) or part < 0:
+            part = 0
+        value = value * (10 ** len(str(cap))) + min(part, cap)
+    return value
+
+
+def _fold_custom_rule_stats(state, stats):
+    if not stats:
+        return
+    kept = state.get("custom_rules")
+    if not isinstance(kept, dict):
+        kept = state["custom_rules"] = {}
+    for key in CUSTOM_RULE_KEYS:
+        new, old = stats.get(key, 0), kept.get(key, 0)
+        if not isinstance(old, int):
+            old = 0
+        if key == "cr_shapes":
+            value = old | new
+        elif key in ("cr_rules", "cr_slow_ms"):
+            value = max(old, new)
+        else:
+            value = old + new
+        if value:
+            kept[key] = value
+
+
+def record_custom_rule_stats(session_id, stats):
+    """Fold one edit's custom rule counts into the turn's. Telemetry only."""
+    with_locked_state(session_id, lambda state: _fold_custom_rule_stats(state, stats))
 
 
 def consume_stop_state(session_id, clear=True):
@@ -103,6 +164,7 @@ def consume_stop_state(session_id, clear=True):
             # Where and when the prompt hook captured it; see baseline_origin.
             "baseline_root": state.get("baseline_root"),
             "prompt_at": state.get("prompt_at"),
+            "turn_started": state.get("turn_started"),
             "baseline_kept": state.get("baseline_kept") or 0,
             "untracked_at_baseline": (
                 dict(state["untracked_at_baseline"])
@@ -116,30 +178,65 @@ def consume_stop_state(session_id, clear=True):
             "state_resets": state.get("state_resets", 0),
             "state_overwrites": state.get("state_overwrites", 0),
             "baseline_fail": state.get("baseline_fail") or 0,
+            "custom_rules": (
+                dict(state["custom_rules"])
+                if isinstance(state.get("custom_rules"), dict) else {}
+            ),
         }
         # touched_paths is cleared per Stop, but one baseline can be
         # reviewed by several Stops (rewakes). turn_touched keeps every path
-        # recorded since the baseline; only telemetry reads it.
+        # recorded since the prompt hook's baseline. Read by the scope
+        # metric and, through touched_since_prompt, by the no-edit-record note.
         turn = list(dict.fromkeys(
             [p for p in state.get("turn_touched", []) if isinstance(p, str)]
-            + snap["touched_paths"]))[-200:]
+            + snap["touched_paths"]))[-TOUCHED_PATHS_CAP:]
         snap["turn_touched"] = turn
         if clear:
+            if snap["state_resets"] or snap["state_overwrites"]:
+                # turn_touched outlives this Stop, and so does its gap.
+                state["turn_touched_lost"] = True
             state["turn_touched"] = turn
             state["touched_paths"] = []
             state.pop("reviewed_diff_hash", None)
             state.pop("state_resets", None)
             state.pop("state_overwrites", None)
+            state.pop("custom_rules", None)
         return snap
 
     return with_locked_state(session_id, _snap) or {
         "touched_paths": [], "baseline_sha": None, "head_at_capture": None,
         "untracked_at_baseline": {}, "baseline_root": None, "prompt_at": None,
-        "baseline_kept": 0,
+        "baseline_kept": 0, "turn_started": None,
         "fire_count": 0, "fire_count_expired": False, "previous_findings": [],
         "reviewed_diff_hash": None, "state_resets": 0, "state_overwrites": 0,
-        "baseline_fail": 0, "turn_touched": [],
+        "baseline_fail": 0, "turn_touched": [], "custom_rules": {},
     }
+
+
+# record_touched_path and turn_touched keep the newest paths only.
+TOUCHED_PATHS_CAP = 200
+
+
+def touched_since_prompt(session_id):
+    """(paths, complete): every path the session's edit tools recorded since
+    the prompt hook's baseline, read now and without consuming or writing
+    anything, so edits recorded while a Stop review runs are in it.
+    `complete` is False when the list is known to be missing paths: the
+    state was lost or overwritten since the prompt, it could not be read, or
+    the prompt hook's own save is not in it. Callers check the length
+    against TOUCHED_PATHS_CAP."""
+    try:
+        state = load_state(session_id)
+    except Exception:
+        return [], False
+    if not isinstance(state, dict):
+        return [], False
+    paths = list(dict.fromkeys(
+        [p for p in state.get("turn_touched", []) if isinstance(p, str)]
+        + [p for p in state.get("touched_paths", []) if isinstance(p, str)]))
+    lost = (state.get("state_resets") or state.get("state_overwrites")
+            or state.get("turn_touched_lost"))
+    return paths, not lost and state.get("prompt_at") is not None
 
 
 # Path names compare without case where the filesystem usually does.
@@ -150,13 +247,21 @@ def _rel_in_repo(real_root, path):
     """`path` relative to the repo root (a real path), or None when it lies
     outside the repo."""
     real = os.path.realpath(path)
+    if sys.platform == "darwin":
+        # git and the file system can spell one name composed and decomposed.
+        real = unicodedata.normalize("NFC", real)
+        real_root = unicodedata.normalize("NFC", real_root)
+    if _FOLD_CASE:
+        # Fold before comparing: realpath keeps the case a path was typed in,
+        # so the repo folder itself can be spelled differently too.
+        real, real_root = real.casefold(), real_root.casefold()
     try:
         rel = os.path.relpath(real, real_root)
     except ValueError:  # another drive
         return None
     if rel == os.pardir or rel.startswith(os.pardir + os.sep):
         return None
-    return rel.casefold() if _FOLD_CASE else rel
+    return rel
 
 
 def touched_scope(repo_root, cwd, touched_paths):
@@ -164,7 +269,7 @@ def touched_scope(repo_root, cwd, touched_paths):
     (scope, repo-relative paths inside the repo). scope: 0 none recorded,
     1 all inside the reviewed repo, 2 some outside, 3 all outside. Relative
     paths are read against `cwd`. The list holds the newest 200 paths, so
-    this is approximate past that. Telemetry only."""
+    this is approximate past that."""
     root = os.path.realpath(repo_root)
     inside, outside = set(), 0
     for p in touched_paths:
@@ -198,6 +303,44 @@ def review_scope_code(repo_root, scope, inside, files, base_fail):
     return int(base_fail or 0) * 100000 + scope * 10000 + min(untouched, 9999)
 
 
+def findings_without_edit_record(session_id, at_stop_start, repo_root, cwd,
+                                 finding_paths, reviewed):
+    """Which findings are in a reviewed file for which there is no record of
+    this session's edit tools writing it since the prompt: (those files as
+    the review named them, in order and without repeats; how many findings
+    they hold). The count is -1, with no files, when the record is known to
+    be incomplete: lost state, or more paths than the list keeps.
+
+    `at_stop_start`: turn_touched as the Stop began; a prompt that arrives
+    while the review runs resets the stored list. A finding path that is not
+    one of the `reviewed` files, or that cannot be resolved, is left out."""
+    since, complete = touched_since_prompt(session_id)
+    touched = list(dict.fromkeys(list(at_stop_start) + since))
+    if not complete or len(touched) >= TOUCHED_PATHS_CAP:
+        return [], -1
+    _, inside = touched_scope(repo_root, cwd, touched)
+    root = os.path.realpath(repo_root)
+
+    def rel(f):
+        try:
+            return _rel_in_repo(root, os.path.join(root, f))
+        except (ValueError, OSError):  # NUL, or a name the OS cannot encode
+            return None
+    candidates = {}
+    for f in reviewed:
+        r = rel(f)
+        if r is not None and r not in inside:
+            candidates.setdefault(r, f)
+    names, count = [], 0
+    for f in finding_paths:
+        r = rel(f) if isinstance(f, str) and f else None
+        if r in candidates:
+            count += 1
+            if candidates[r] not in names:
+                names.append(candidates[r])
+    return names, count
+
+
 def record_reviewed_diff(session_id, diff_hash):
     def _save(state):
         state["reviewed_diff_hash"] = diff_hash
@@ -220,8 +363,8 @@ def restore_unreviewed_stop_state(session_id, paths, baseline_sha):
     def _restore(state):
         existing = state.get("touched_paths", [])
         merged = list(dict.fromkeys(list(paths) + list(existing)))
-        if len(merged) > 200:
-            merged = merged[:200]
+        if len(merged) > TOUCHED_PATHS_CAP:
+            merged = merged[:TOUCHED_PATHS_CAP]
         state["touched_paths"] = merged
         if baseline_sha and not state.get("baseline_sha"):
             state["baseline_sha"] = baseline_sha
@@ -319,7 +462,7 @@ def get_baseline_file_content(session_id, file_path, cwd):
 
 
 # How the last capture_git_baseline call got its SHA: 0 a real snapshot,
-# 1 `stash create` failed and HEAD was returned, 2 no index copy and HEAD was
+# 1 the snapshot failed and HEAD was returned, 2 no index copy and HEAD was
 # returned. With 1 or 2 the next Stop review cannot tell the turn's changes
 # from uncommitted work that was already there. Stored with baseline_sha.
 # Telemetry only.
@@ -328,29 +471,110 @@ last_baseline_fail = 0
 last_index_entries = None
 
 
+# Who the snapshot commit is made by. Set on every commit-tree call, so the
+# user's own name never appears on a commit they did not make and a repo with
+# no identity configured still works. The commit object does land in
+# `.git/objects`, but nothing refers to it, like the one `git stash create`
+# used to make here: it is prunable from the moment it is written.
+_SNAPSHOT_IDENT = {
+    "GIT_AUTHOR_NAME": "security-guidance", "GIT_AUTHOR_EMAIL": "security-guidance@localhost",
+    "GIT_COMMITTER_NAME": "security-guidance", "GIT_COMMITTER_EMAIL": "security-guidance@localhost",
+}
+
+# The whole snapshot, not one command: `stash create` was capped at 15 s and a
+# per-command cap would let a slow filesystem hold the prompt for far longer.
+_SNAPSHOT_BUDGET_S = 15
+
+
+def _snapshot_commit(cwd, env, head_tree):
+    """A commit of every tracked change, on the index copy `env` names.
+
+    Returns its SHA, "" when nothing tracked has changed (so the caller uses
+    HEAD, `head_tree` being HEAD's tree), or None when git refused or the
+    time budget ran out.
+
+    No `--missing-ok`: git counts a partial clone's promisor blobs as
+    present, so write-tree neither fetches nor fails on one, and the
+    existence check it would turn off is worth keeping.
+    """
+    deadline = time.monotonic() + _SNAPSHOT_BUDGET_S
+
+    def run(args, extra=None):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired(args, _SNAPSHOT_BUDGET_S)
+        return subprocess.run(
+            [*GIT_CMD, *args], cwd=cwd, capture_output=True, timeout=left,
+            env={**env, **(extra or {})},
+        )
+
+    # No pathspec: `add -u` has staged the whole work tree, whatever directory
+    # of it `cwd` is, since git 2.0. `-- :/` would say the same but fails
+    # outright under a user's GIT_LITERAL_PATHSPECS.
+    add = run(["add", "-u"])
+    if add.returncode != 0:
+        debug_log(f"Snapshot: add -u failed: {_stderr_of(add)}")
+        return None
+    tree = run(["write-tree"])
+    sha = (tree.stdout or b"").decode("utf-8", errors="replace").strip()
+    if tree.returncode != 0 or not sha:
+        debug_log(f"Snapshot: write-tree failed: {_stderr_of(tree)}")
+        return None
+    if sha == head_tree:
+        return ""
+    if gitutil.last_dropped_gitlinks:
+        # A nested repository's entry is gone from the index copy, so the
+        # tree cannot equal HEAD's even on a clean work tree. Ask whether
+        # anything but those entries differs, rather than writing a commit
+        # object on every prompt in a repo with submodules.
+        same = run(["diff-tree", "--quiet", "--ignore-submodules=all", head_tree, sha])
+        if same.returncode == 0:
+            return ""
+    commit = run(["-c", "commit.gpgsign=false", "commit-tree", sha, "-p", "HEAD",
+                  "-m", "security-guidance turn baseline"], _SNAPSHOT_IDENT)
+    out = (commit.stdout or b"").decode("utf-8", errors="replace").strip()
+    if commit.returncode != 0 or not out:
+        debug_log(f"Snapshot: commit-tree failed: {_stderr_of(commit)}")
+        return None
+    return out
+
+
+def _stderr_of(result):
+    return (result.stderr or b"").decode("utf-8", errors="replace").strip()[:200]
+
+
 def capture_git_baseline(cwd):
     """
     Capture a git ref representing the current working tree state.
-    Uses `git stash create` which creates a commit object for the current state
-    (HEAD + uncommitted changes) without modifying the stash list or working tree.
+    Builds a commit object for the current state (HEAD + uncommitted changes)
+    without touching the stash list or the working tree: `add -u` stages every
+    tracked change into a throwaway index copy, `write-tree` turns that into a
+    tree, and `commit-tree` hangs it off HEAD.
     Falls back to HEAD if the working tree is clean.
     Returns the SHA string, or None if not in a git repo or if the repo has no commits.
 
-    `stash create` runs on a throwaway copy of the index (GIT_INDEX_FILE), so
-    its `index.lock` and `index.stash.<pid>` files land next to the copy, not
-    in `.git`: it cannot collide with a concurrent git command, and a timeout
-    kill cannot leave a lock that blocks the user's next one.
-    GIT_OPTIONAL_LOCKS does not cover stash. Copying the real index without a
-    lock is safe: git replaces it by atomic rename.
+    This was `git stash create`, which does the same thing in one command but
+    checks the work tree on a single thread, while `add -u` uses git's index
+    preload (one thread per 500 entries, up to 20). On a filesystem where each
+    file status is slow — a WSL repository on a Windows drive, a network mount
+    — that is the whole cost of the prompt: see #6854, where `stash create`
+    took 4 s on 1,424 files and never finished on 10,000.
 
-    NOTE: `git stash create` does NOT capture untracked files. UPS pairs this
+    The commands run on a throwaway copy of the index (GIT_INDEX_FILE), so
+    their `index.lock` lands next to the copy, not in `.git`: they cannot
+    collide with a concurrent git command, and a timeout kill cannot leave a
+    lock that blocks the user's next one. GIT_OPTIONAL_LOCKS does not cover
+    these. Copying the real index without a lock is safe: git replaces it by
+    atomic rename.
+
+    NOTE: the snapshot does NOT capture untracked files. UPS pairs this
     SHA with a `_list_untracked()` snapshot stored as `untracked_at_baseline`,
     and `compute_v2_review_set` subtracts that set so pre-existing untracked
     files are not reviewed as Claude-authored. UPS takes no snapshot while the
     Stop review, its only reader, is switched off.
     """
     # stdout is a SHA so text=True is safe on stdout, but a non-ASCII
-    # filename in `git stash create`'s STDERR warning (e.g. a worktree
+    # filename in git's STDERR warning (e.g. a worktree
     # with `Ávila_report.txt` triggers a quotePath/locale warning) would
     # trip the stderr reader thread on Windows cp1252. Decode both streams
     # leniently for symmetry with _list_untracked. See #2056.
@@ -358,15 +582,19 @@ def capture_git_baseline(cwd):
     last_baseline_fail = 0
     last_index_entries = None
     try:
-        # Check if HEAD exists (i.e., repo has at least one commit)
+        # HEAD's commit and its tree in one call: the commit is the answer
+        # for a clean tree, the tree is what the snapshot is compared with.
+        # A failure here means the repo has no commits — skip the review
+        # rather than create commits in the user's repo.
         head_check = subprocess.run(
-            [*GIT_CMD, "rev-parse", "HEAD"],
+            [*GIT_CMD, "rev-parse", "HEAD", "HEAD^{tree}"],
             cwd=cwd, capture_output=True, timeout=5
         )
-        if head_check.returncode != 0:
-            # No commits yet — skip review rather than creating commits in the user's repo
+        head_out = (head_check.stdout or b"").decode("utf-8", errors="replace").split()
+        if head_check.returncode != 0 or len(head_out) != 2:
             debug_log("No commits in repo, skipping baseline capture")
             return None
+        head_sha, head_tree = head_out
 
         sha = ""
         # untracked_paths=[]: a plain copy of the index, no `add -N` pass.
@@ -375,25 +603,14 @@ def capture_git_baseline(cwd):
             # back to HEAD.
             if env is not None:
                 last_index_entries = index_entry_count(env["GIT_INDEX_FILE"])
-                result = subprocess.run(
-                    [*GIT_CMD, "stash", "create"],
-                    cwd=cwd, capture_output=True, timeout=15, env=env
-                )
-                sha = (result.stdout or b"").decode("utf-8", errors="replace").strip()
-                if not sha and result.returncode != 0:
+                sha = _snapshot_commit(cwd, env, head_tree)
+                if sha is None:
                     last_baseline_fail = 1
+                    sha = ""
             else:
                 last_baseline_fail = 2
-        if sha:
-            return sha
-
-        # Working tree is clean — stash create returns empty. Use HEAD.
-        result = subprocess.run(
-            [*GIT_CMD, "rev-parse", "HEAD"],
-            cwd=cwd, capture_output=True, timeout=5
-        )
-        sha = (result.stdout or b"").decode("utf-8", errors="replace").strip()
-        return sha if sha else None
+        # No snapshot: nothing tracked has changed, or it could not be taken.
+        return sha or head_sha
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError) as e:
         debug_log(f"Failed to capture git baseline: {e}")
         return None
@@ -437,6 +654,52 @@ def capture_git_baseline(cwd):
 _REVIEWED_SHAS_BASENAME = "sg-reviewed-shas"
 _REVIEWED_SHAS_CAP = 500
 
+# The records and markers this module keeps in the git directory are small
+# regular files of its own. Whatever else has one of their names is not one of
+# them: a link leads to a file that is not the plugin's to read or change, and
+# opening a pipe can hold a hook until its timeout. The largest of them is cut
+# back at 1 MiB, and no more than this is ever read from one.
+_OWN_FILE_MAX_BYTES = 4 * 1024 * 1024
+_NO_FOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _is_own_file(st):
+    return (stat.S_ISREG(st.st_mode) and st.st_nlink <= 1
+            and st.st_size <= _OWN_FILE_MAX_BYTES)
+
+
+def _open_own_file(path, flags, mode=0o666):
+    """os.open for one of those files. Also works as the `opener` of open().
+    Anything else at `path` is replaced by a new file when `flags` would create
+    one, as session_state does for the state file, and refused with OSError
+    otherwise. The open itself never waits.
+
+    After the open the name is looked at again and has to be that very file:
+    it can come to mean something else at any moment before that."""
+    try:
+        if not _is_own_file(os.lstat(path)):
+            if not flags & os.O_CREAT:
+                raise OSError(errno.EINVAL, "not a file of the plugin's", path)
+            flags |= os.O_EXCL
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+    except FileNotFoundError:
+        pass
+    fd = os.open(path, flags | _NO_FOLLOW | getattr(os, "O_NONBLOCK", 0), mode)
+    try:
+        seen, st = os.lstat(path), os.fstat(fd)
+        own = (_is_own_file(seen) and _is_own_file(st)
+               and (st.st_ino, st.st_dev) == (seen.st_ino, seen.st_dev))
+    except OSError:
+        own = False
+    if not own:
+        os.close(fd)
+        raise OSError(errno.EINVAL, "not a file of the plugin's", path)
+    return fd
+
+
 def _is_full_sha(sha):
     return len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)
 
@@ -454,8 +717,8 @@ def _load_reviewed_shas(repo_root, _gd=None):
         return set()
     out = set()
     try:
-        with open(p, "r") as f:
-            for line in f:
+        with open(p, "r", errors="replace", opener=_open_own_file) as f:
+            for line in f.read(_OWN_FILE_MAX_BYTES).splitlines():
                 sha = line.split("\t", 1)[0].strip()
                 if _is_full_sha(sha):
                     out.add(sha)
@@ -469,7 +732,8 @@ def _append_reviewed_shas(repo_root, shas, vulns_found=0):
 
     Uses fcntl.flock for the read-gc-write; appends are O_APPEND-atomic but
     GC needs the lock so concurrent CC sessions in the same clone don't race
-    each other's truncation.
+    each other's truncation. The findings go out after this call, so it waits
+    for the lock only a moment, then appends without it.
     """
     p = _reviewed_shas_path(repo_root)
     if not p or not shas:
@@ -480,11 +744,12 @@ def _append_reviewed_shas(repo_root, shas, vulns_found=0):
     lines = [f"{s}\t{ts}\t{pv}\t{int(vulns_found)}\n" for s in shas]
     try:
         import fcntl
-        with open(p, "a+") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        with open(p, "a+", errors="replace", opener=_open_own_file) as f:
+            if not _seen_lock(f.fileno()):
+                raise OSError("record is locked")
             try:
                 f.seek(0)
-                existing = f.read().splitlines(keepends=True)
+                existing = f.read(_OWN_FILE_MAX_BYTES).splitlines(keepends=True)
                 # Dedup by sha (first column) — keep newest, then cap.
                 seen = set()
                 merged = []
@@ -497,16 +762,102 @@ def _append_reviewed_shas(repo_root, shas, vulns_found=0):
                 f.seek(0)
                 f.truncate()
                 f.writelines(merged)
+                f.flush()  # while the lock is still held
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     except (OSError, ImportError):
-        # fcntl unavailable (Windows) or write failed — degrade to plain
-        # append; cap enforcement happens on the next locked write.
+        # fcntl unavailable (Windows), lock held or write failed — degrade to
+        # plain append; cap enforcement happens on the next locked write.
         try:
-            with open(p, "a") as f:
+            with open(p, "a", opener=_open_own_file) as f:
                 f.writelines(lines)
         except OSError:
             pass
+
+
+# ─── commits of a turn, count only ──────────────────────────────────────────
+#
+# A commit review starts from a hook on the Bash or PowerShell tool. A commit
+# made another way (a script, the user's own terminal) starts none.
+# The Stop row says how many commits a turn made and how many of them no
+# commit hook saw. Nothing reads these to decide whether a review runs.
+#
+# Kept in a file of its own per session, append-only: saving the session state
+# from one more background hook could drop another hook's change where there
+# is no state lock (Windows). Lines: `seen <sha prefix>` from commit hooks,
+# `counted <sha>` from the Stop hook. Every session's are read, so a commit
+# is seen by any of them and counted once on this machine.
+
+TURN_COMMITS_ERROR = -1
+
+
+def _note_commits(session_id, kind, shas):
+    """Never raises."""
+    if not shas or portable_output():
+        return
+    try:
+        path = get_commit_log_file(session_id)
+        make_state_dir(os.path.dirname(path))
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write("".join(f"{kind} {sha}\n" for sha in shas))
+    except Exception as e:
+        debug_log(f"{kind} commits not noted: {e}")
+
+
+def note_seen_commits(session_id, shas):
+    """A commit hook saw these commits."""
+    _note_commits(session_id, "seen", shas)
+
+
+def note_counted_commits(session_id, shas):
+    """These commits went out in a Stop row."""
+    _note_commits(session_id, "counted", shas)
+
+
+def turn_commits_code(repo_root, prompt_at, until, head_before=None):
+    """(code, shas) for the commits made in this checkout from the prompt to
+    `until` that no Stop row has counted yet:
+
+        made * 10000 + no_review * 100 + unseen     (each capped at 99)
+
+    no_review: no finished or running review in this clone, for whatever
+    reason. unseen: of those, the ones no commit hook saw. The code is None
+    when nothing was committed or the start of the turn is not known,
+    TURN_COMMITS_ERROR when git could not say."""
+    if not isinstance(prompt_at, (int, float)) or not 0 < prompt_at < 1e11:
+        return None, []
+    shas = turn_commit_shas(repo_root, prompt_at, until, head_before)
+    if not shas:
+        return (TURN_COMMITS_ERROR if shas is None else None), []
+    noted = {"seen": set(), "counted": set()}
+    for path in commit_log_files(newer_than=prompt_at):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    kind, _, value = line.strip().partition(" ")
+                    if value and kind in noted:
+                        noted[kind].add(value)
+        except OSError:
+            return TURN_COMMITS_ERROR, []
+    new = [s for s in shas if s not in noted["counted"]]
+    if not new:
+        return None, []
+    gd = _git_dir(repo_root)
+    if not gd:
+        return TURN_COMMITS_ERROR, []
+    # The marker file, not its lock: taking the lock for a moment could make
+    # the review that is about to claim the commit leave it alone. Markers
+    # first: a review that ends in between then reads as finished.
+    missed = [s for s in new
+              if not os.path.exists(os.path.join(gd, _INFLIGHT_PREFIX + s))]
+    reviewed = _load_reviewed_shas(repo_root, _gd=gd)
+    missed = [s for s in missed if s not in reviewed]
+    seen = tuple(noted["seen"])
+    unseen = sum(1 for s in missed if not s.startswith(seen))
+    code = min(len(new), 99) * 10000 + min(len(missed), 99) * 100 + min(unseen, 99)
+    return code, new
 
 
 # ─── repeated-diff count ────────────────────────────────────────────────────
@@ -595,7 +946,7 @@ def _append_diff_row(f, locked, token, done):
     if locked is not False and size + len(row) > _SEEN_DIFFS_TRIM_BYTES:
         f.seek(0)
         keep, room = [], _SEEN_DIFFS_TRIM_BYTES // 2
-        for ln in reversed(f.read().splitlines(keepends=True)):
+        for ln in reversed(f.read(_OWN_FILE_MAX_BYTES).splitlines(keepends=True)):
             room -= len(ln)
             if room < 0:
                 break
@@ -629,12 +980,12 @@ def _diff_review_started(repo_root, diff_files, tip="HEAD"):
         best = dict.fromkeys(keys, DIFF_SEEN_NO)
         # Read and note under one lock, so two reviews of one diff that start
         # together cannot both miss each other.
-        with open(token[0], "a+b") as f:
+        with open(token[0], "a+b", opener=_open_own_file) as f:
             locked = _seen_lock(f.fileno())
             if locked is False:
                 raise OSError("record is locked")
             f.seek(0)
-            for ln in f.read().decode("ascii", "replace").splitlines():
+            for ln in f.read(_OWN_FILE_MAX_BYTES).decode("ascii", "replace").splitlines():
                 row = ln.split("\t")
                 if len(row) != 4 or not row[0].isdigit() or len(row[0]) > 12:
                     continue
@@ -661,7 +1012,7 @@ def _diff_review_done(token):
     if not token:
         return
     try:
-        with open(token[0], "a+b") as f:
+        with open(token[0], "a+b", opener=_open_own_file) as f:
             _append_diff_row(f, _seen_lock(f.fileno()), token, done=True)
     except Exception as e:
         debug_log(f"Repeated-diff count: verdict not noted ({type(e).__name__}: {e})")
@@ -811,9 +1162,13 @@ def _sweep_inflight(gd):
         if not name.startswith(_INFLIGHT_PREFIX) or p in _inflight_held:
             continue
         try:
-            if os.path.getmtime(p) > cutoff:
+            st = os.lstat(p)
+            if st.st_mtime > cutoff:
                 continue
-            fd = os.open(p, os.O_RDWR)
+            if not _is_own_file(st):
+                os.unlink(p)  # no marker, so nobody holds it
+                continue
+            fd = _open_own_file(p, os.O_RDWR)
         except OSError:
             continue
         try:
@@ -837,7 +1192,7 @@ def _mark_inflight(repo_root, shas):
             if not _is_full_sha(sha) or p in _inflight_held:
                 continue
             try:
-                fd = _again_if_refused(os.open, p, os.O_RDWR | os.O_CREAT, 0o600)
+                fd = _again_if_refused(_open_own_file, p, os.O_RDWR | os.O_CREAT, 0o600)
             except OSError:
                 # One marker that cannot be opened does not cost the others
                 # their claim.
@@ -863,7 +1218,9 @@ def _mark_inflight(repo_root, shas):
                 import atexit
                 atexit.register(_release_inflight)
             _inflight_held[p] = fd
-            os.utime(p)
+            # The open file where that can be named; Windows keeps the name
+            # on this file for as long as it is open.
+            os.utime(fd if os.utime in os.supports_fd else p)
     except Exception:
         pass
 
@@ -879,7 +1236,7 @@ def _load_inflight_shas(repo_root, shas, _gd=None):
         if not _is_full_sha(sha) or p in _inflight_held:
             continue
         try:
-            fd = os.open(p, os.O_RDONLY)
+            fd = _open_own_file(p, os.O_RDONLY)
         except OSError:
             continue
         try:
@@ -997,12 +1354,12 @@ def compute_v2_review_set(cwd, baseline_sha, head_at_capture, untracked_at_basel
 
     review_set = (files dirty vs current HEAD, plus files committed this turn
     when HEAD advanced linearly) ∩ (files whose content differs from the
-    pre-turn stash baseline). The first term is immune to checkout/pull
+    pre-turn baseline). The first term is immune to checkout/pull
     ballooning; the second filters out the user's untouched pre-turn WIP.
     Falls back to dirty_now alone when no baseline is available.
 
     untracked_at_baseline: {repo-root-relative path: mtime_ns} captured at
-    UPS. `git stash create` doesn't include untracked files, so without this
+    UPS. The baseline snapshot doesn't include untracked files, so without this
     snapshot a pre-existing untracked file looks "new since baseline" forever.
     A file is excluded only if it was untracked at baseline AND its mtime is
     unchanged — an in-place edit during the turn is still reviewed.
@@ -1073,11 +1430,11 @@ def compute_v2_review_set(cwd, baseline_sha, head_at_capture, untracked_at_basel
         dirty_now |= _git_name_only(repo, f"{head_at_capture}..HEAD") or set()
         diff_base = head_at_capture
 
-    # changed_since: tracked files vs the stash baseline (no `add -N` — the
-    # stash never contained untracked files anyway), then union with
+    # changed_since: tracked files vs the turn baseline (no `add -N` — the
+    # baseline never contained untracked files anyway), then union with
     # currently-untracked. The previous `include_untracked=True` arm cost a
     # full `git add -N .` (slow in large repos) per call to surface
-    # untracked files in the diff output — but `git diff <stash>` already
+    # untracked files in the diff output — but `git diff <baseline>` already
     # lists them as "only in worktree" without that, and we have the explicit
     # set from status regardless.
     if baseline_sha:
@@ -1087,9 +1444,13 @@ def compute_v2_review_set(cwd, baseline_sha, head_at_capture, untracked_at_basel
     else:
         changed_since = None
     # changed_since is None on missing baseline OR on git error (e.g. the
-    # dangling stash SHA was pruned). Either way, don't intersect with ∅ —
+    # dangling baseline SHA was pruned). Either way, don't intersect with ∅ —
     # that would silently zero the review set. Fall back to dirty_now.
     review_set = (dirty_now & changed_since) if changed_since is not None else dirty_now
+    # Kept beside its new name so that the content diff pairs the two.
+    secret_origins = {
+        old for new, old in _secret_rename_origins.items() if new in review_set}
+    review_set = review_set | secret_origins
 
     review_paths = [os.path.join(repo, p) for p in sorted(review_set)]
     untracked_in_review = sorted(new_untracked & review_set)
@@ -1101,4 +1462,6 @@ def compute_v2_review_set(cwd, baseline_sha, head_at_capture, untracked_at_basel
     # Only emit when nonzero to stay under the 10-key telemetry cap.
     if preexisting_unchanged:
         metrics["preexisting_untracked_excluded"] = len(preexisting_unchanged)
+    if secret_origins:
+        metrics["secret_renamed"] = len(secret_origins)
     return review_paths, diff_base, repo, untracked_in_review, metrics
